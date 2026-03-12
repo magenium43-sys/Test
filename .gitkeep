@@ -1,0 +1,208 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/merge_specs.py b/merge_specs.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4cde7024e6a1776d61e62ba2281c3014c8c935e2
+--- /dev/null
++++ b/merge_specs.py
+@@ -0,0 +1,198 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import argparse
++import re
++from dataclasses import dataclass
++from typing import Dict, Iterable, Optional
++
++import pandas as pd
++from rapidfuzz import fuzz
++
++
++NULL_VALUE = "NULL"
++
++
++def normalize_text(text: str) -> str:
++    text = str(text).strip().lower().replace("ё", "е")
++    text = re.sub(r"[\t\n\r]+", " ", text)
++    text = re.sub(r"[^\w\s]+", " ", text, flags=re.UNICODE)
++    text = re.sub(r"\s+", " ", text).strip()
++    return text
++
++
++def load_synonyms(path: Optional[str]) -> Dict[str, str]:
++    if not path:
++        return {}
++
++    df = pd.read_csv(path)
++    required = {"alias", "canonical"}
++    if not required.issubset(df.columns):
++        raise ValueError(
++            f"Synonyms file must contain columns {required}, got {set(df.columns)}"
++        )
++
++    mapping: Dict[str, str] = {}
++    for _, row in df.iterrows():
++        alias = normalize_text(row["alias"])
++        canonical = str(row["canonical"]).strip()
++        if alias:
++            mapping[alias] = canonical
++    return mapping
++
++
++@dataclass
++class MatchResult:
++    canonical_parameter: str
++    score: int
++    mode: str
++
++
++class ParameterMatcher:
++    def __init__(
++        self,
++        canonical_parameters: Iterable[str],
++        synonyms: Dict[str, str],
++        threshold: int,
++    ) -> None:
++        self.threshold = threshold
++        self.synonyms = synonyms
++        self.canonical_original = [str(p).strip() for p in canonical_parameters]
++        self.canonical_normalized = {
++            normalize_text(original): original for original in self.canonical_original
++        }
++
++    def match(self, incoming_parameter: str) -> Optional[MatchResult]:
++        normalized = normalize_text(incoming_parameter)
++
++        if not normalized:
++            return None
++
++        synonym_hit = self.synonyms.get(normalized)
++        if synonym_hit and synonym_hit in self.canonical_original:
++            return MatchResult(canonical_parameter=synonym_hit, score=100, mode="synonym")
++
++        if normalized in self.canonical_normalized:
++            return MatchResult(
++                canonical_parameter=self.canonical_normalized[normalized],
++                score=100,
++                mode="exact",
++            )
++
++        best_original = None
++        best_score = -1
++        for normalized_canonical, original_canonical in self.canonical_normalized.items():
++            score = fuzz.token_sort_ratio(normalized, normalized_canonical)
++            if score > best_score:
++                best_score = score
++                best_original = original_canonical
++
++        if best_original is not None and best_score >= self.threshold:
++            return MatchResult(
++                canonical_parameter=best_original,
++                score=int(best_score),
++                mode="fuzzy",
++            )
++
++        return None
++
++
++def merge_specs(
++    base_path: str,
++    incoming_path: str,
++    output_path: str,
++    new_column: str,
++    synonyms_path: Optional[str],
++    threshold: int,
++) -> pd.DataFrame:
++    base_df = pd.read_excel(base_path)
++    incoming_df = pd.read_excel(incoming_path)
++
++    if "parameter" not in base_df.columns:
++        raise ValueError("Base file must contain 'parameter' column")
++
++    required_incoming_columns = {"parameter", "value"}
++    if not required_incoming_columns.issubset(incoming_df.columns):
++        raise ValueError(
++            "Incoming file must contain columns: 'parameter' and 'value'"
++        )
++
++    base_df = base_df.copy()
++    base_df["parameter"] = base_df["parameter"].astype(str).str.strip()
++
++    synonyms = load_synonyms(synonyms_path)
++    matcher = ParameterMatcher(
++        canonical_parameters=base_df["parameter"].tolist(),
++        synonyms=synonyms,
++        threshold=threshold,
++    )
++
++    if new_column in base_df.columns:
++        raise ValueError(f"Column '{new_column}' already exists in base table")
++
++    base_df[new_column] = NULL_VALUE
++
++    parameter_to_row = {p: idx for idx, p in enumerate(base_df["parameter"].tolist())}
++
++    for _, row in incoming_df.iterrows():
++        incoming_param = str(row.get("parameter", "")).strip()
++        incoming_value = row.get("value", NULL_VALUE)
++        incoming_value = NULL_VALUE if pd.isna(incoming_value) else str(incoming_value).strip()
++
++        if not incoming_param:
++            continue
++
++        match = matcher.match(incoming_param)
++        if match is not None:
++            row_idx = parameter_to_row[match.canonical_parameter]
++            base_df.at[row_idx, new_column] = incoming_value or NULL_VALUE
++        else:
++            new_row = {col: NULL_VALUE for col in base_df.columns}
++            new_row["parameter"] = incoming_param
++            new_row[new_column] = incoming_value or NULL_VALUE
++            base_df = pd.concat([base_df, pd.DataFrame([new_row])], ignore_index=True)
++            parameter_to_row[incoming_param] = len(base_df) - 1
++
++    base_df.to_excel(output_path, index=False)
++    return base_df
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description="Merge equipment specs from incoming Excel into base canonical table"
++    )
++    parser.add_argument("--base", required=True, help="Path to base Excel file")
++    parser.add_argument(
++        "--incoming", required=True, help="Path to incoming Excel with parameter/value"
++    )
++    parser.add_argument("--output", required=True, help="Path to output merged Excel")
++    parser.add_argument(
++        "--new-column",
++        required=True,
++        help="Name of the new manufacturer/model column to append",
++    )
++    parser.add_argument(
++        "--synonyms",
++        required=False,
++        default=None,
++        help="Optional CSV with columns alias,canonical",
++    )
++    parser.add_argument(
++        "--threshold",
++        type=int,
++        default=88,
++        help="Fuzzy match score threshold (0-100), default 88",
++    )
++    return parser.parse_args()
++
++
++if __name__ == "__main__":
++    args = parse_args()
++    merge_specs(
++        base_path=args.base,
++        incoming_path=args.incoming,
++        output_path=args.output,
++        new_column=args.new_column,
++        synonyms_path=args.synonyms,
++        threshold=args.threshold,
++    )
+ 
+EOF
+)
